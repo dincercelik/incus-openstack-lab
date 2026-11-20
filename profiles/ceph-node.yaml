@@ -1,0 +1,16 @@
+config:
+  limits.cpu: "4"
+  limits.memory: 4GiB
+  security.secureboot: "false"
+description: Empty Ceph node VM, PXE-booted and deployed by MAAS (OSD disks added
+  per instance)
+devices:
+  eth0:
+    boot.priority: "10"
+    network: maas-pxe
+    type: nic
+  root:
+    path: /
+    pool: ${POOL}
+    size: 20GiB
+    type: disk

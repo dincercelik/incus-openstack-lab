@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Create or delete empty, PXE-booting Ceph node VMs with dedicated OSD disks.
+# No set -e: a failure on one VM must not stop the others.
+set -uo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+POOL=${CEPH_NODE_POOL:-}   # empty: use the pool of the profile's root disk
+PROFILE=${CEPH_NODE_PROFILE:-ceph-node}
+COUNT=${CEPH_NODE_OSDS:-6}
+
+usage() {
+    cat <<EOF
+Usage: incus-ceph-node [--size SIZE] <name>...
+       incus-ceph-node --delete <name>...
+
+Create empty VMs from the '$PROFILE' profile, each with $COUNT block volumes
+(<name>-osd1 ... <name>-osd$COUNT) for Ceph OSDs, on the same storage pool as
+the profile's root disk (override with CEPH_NODE_POOL).
+VMs boot from the network first so MAAS can deploy them; they are not started.
+--delete removes the VMs together with their OSD volumes.
+
+Options:
+  --size SIZE   size of each OSD disk (default: 20GiB)
+  --delete      delete the named VMs and their OSD disks
+  -h, --help    show this help
+
+Examples:
+  incus-ceph-node ceph01 ceph02 ceph03
+  incus-ceph-node --size 10GiB ceph0{1..3}
+  incus-ceph-node --delete ceph0{1..3}
+
+Environment: CEPH_NODE_POOL (profile's pool), CEPH_NODE_PROFILE (ceph-node),
+             CEPH_NODE_OSDS (6)
+EOF
+}
+
+volumes_of() {
+    local i
+    for (( i = 1; i <= COUNT; i++ )); do
+        echo "$1-osd$i"
+    done
+}
+
+delete_node() {
+    local name=$1 found=0 ok=0 vol vols
+    if instance_exists "$name"; then
+        found=1
+        incus delete --force "$name" || ok=1
+    fi
+    mapfile -t vols < <(volumes_of "$name")
+    for vol in "${vols[@]}"; do
+        if volume_exists "$POOL" "$vol"; then
+            found=1
+            incus storage volume delete "$POOL" "$vol" >/dev/null || ok=1
+        fi
+    done
+    if (( ! found )); then
+        warn "$name: no VM or OSD volumes found"
+        return 1
+    fi
+    return $ok
+}
+
+create_node() {
+    local name=$1 vol vols i=0 created=()
+    if instance_exists "$name"; then
+        warn "$name: instance already exists"
+        return 1
+    fi
+    # Never adopt or clean up volumes this run did not create.
+    mapfile -t vols < <(volumes_of "$name")
+    for vol in "${vols[@]}"; do
+        if volume_exists "$POOL" "$vol"; then
+            warn "$name: volume '$vol' already exists (leftover? remove it with: incus storage volume delete $POOL $vol)"
+            return 1
+        fi
+    done
+
+    incus init "$name" --empty --vm -p "$PROFILE" </dev/null >/dev/null || return 1
+    for vol in "${vols[@]}"; do
+        i=$((i + 1))
+        if ! incus storage volume create "$POOL" "$vol" --type=block size="$size" </dev/null >/dev/null; then
+            cleanup_partial "$name" "${created[@]}"
+            return 1
+        fi
+        created+=("$vol")
+        if ! incus config device add "$name" "osd$i" disk pool="$POOL" source="$vol" >/dev/null; then
+            cleanup_partial "$name" "${created[@]}"
+            return 1
+        fi
+    done
+}
+
+# cleanup_partial <name> <volume>...: remove a half-created node and its new volumes.
+cleanup_partial() {
+    local name=$1 vol
+    shift
+    warn "$name: cleaning up partially created node"
+    incus delete --force "$name" >/dev/null
+    for vol; do
+        incus storage volume delete "$POOL" "$vol" >/dev/null
+    done
+}
+
+delete=0 size="" names=()
+while (( $# )); do
+    case $1 in
+        --delete)  delete=1 ;;
+        --size)    size=$(option_value "$@") || exit 1; shift ;;
+        --size=*)  size=${1#*=} ;;
+        -h|--help) usage; exit 0 ;;
+        --)        shift; names+=("$@"); break ;;
+        -*)        die "unknown option: $1 (see --help)" ;;
+        *)         names+=("$1") ;;
+    esac
+    shift
+done
+(( ${#names[@]} )) || { usage >&2; exit 2; }
+check_names "${names[@]}"
+[[ $COUNT =~ ^[1-9][0-9]*$ ]] || die "CEPH_NODE_OSDS must be a positive number"
+if (( delete )) && [[ -n $size ]]; then
+    die "--size cannot be used with --delete"
+fi
+size=${size:-20GiB}
+if [[ -z $POOL ]]; then
+    POOL=$(incus profile device get "$PROFILE" root pool 2>/dev/null || true)
+    [[ -n $POOL ]] || die "cannot read the storage pool from profile '$PROFILE'; set CEPH_NODE_POOL"
+fi
+
+failed=()
+if (( delete )); then
+    for name in "${names[@]}"; do
+        if delete_node "$name"; then
+            echo "Deleted $name and its OSD disks"
+        else
+            failed+=("$name")
+        fi
+    done
+else
+    require_profile "$PROFILE"
+    for name in "${names[@]}"; do
+        if create_node "$name"; then
+            echo "Created $name with $COUNT x $size OSD disks"
+        else
+            failed+=("$name")
+        fi
+    done
+fi
+
+if (( ${#failed[@]} )); then
+    warn "Failed: ${failed[*]}"
+    exit 1
+fi
+if (( ! delete )); then
+    echo "Start them with: incus start ${names[*]}"
+fi

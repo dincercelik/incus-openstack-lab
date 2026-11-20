@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Create or delete the MAAS controller VM (official Ubuntu 24.04 image).
+# Each step depends on the previous one, so stop at the first error.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+PROFILE=${MAAS_PROFILE:-maas-node}
+IMAGE=${MAAS_IMAGE:-ubuntu-noble-official}
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/incus-images
+STREAM=https://cloud-images.ubuntu.com/releases/streams/v1/com.ubuntu.cloud:released:download.json
+WAIT_SECS=${MAAS_WAIT_SECS:-1800}
+KOLLA_CONFIG_DIR=${KOLLA_CONFIG_DIR:-$HOME/kolla-config}
+
+usage() {
+    cat <<EOF
+Usage: incus-maas-node [--kolla-config DIR | --no-kolla-config] [name]
+       incus-maas-node --delete [name]
+
+Create the MAAS VM (default name: maas) from the '$PROFILE' profile and wait
+until the MAAS web UI answers. cloud-init in the profile installs MAAS.
+The profile pins the NIC MAC addresses and the PXE address, so only one VM
+can use it at a time.
+
+If the '$IMAGE' image is missing, the latest official Ubuntu 24.04 build
+for this machine's architecture is downloaded from cloud-images.ubuntu.com,
+verified against Canonical's SHA256 sums and imported.
+Downloads are cached in $CACHE.
+
+The MAAS VM doubles as the kolla-ansible deployment host: a folder on this
+machine is shared into the VM as /etc/kolla (virtiofs), so globals.yml,
+passwords.yml and the config overrides live on the host and survive
+rebuilding the VM. The folder is created if missing and never deleted.
+Files written by the VM's ubuntu user keep your UID on the host; avoid
+writing there as root.
+
+Options:
+  --kolla-config DIR   host folder to share as /etc/kolla
+                       (default: \$KOLLA_CONFIG_DIR or ~/kolla-config)
+  --no-kolla-config    don't share a folder
+  --delete             delete the MAAS VM (the shared folder is kept)
+  -h, --help           show this help
+
+The MAAS address and the SSH key come from the profile; change them with
+setup.sh (MAAS_IP, --ssh-key) and re-run it.
+
+Environment: MAAS_PROFILE (maas-node), MAAS_IMAGE (ubuntu-noble-official),
+             MAAS_WAIT_SECS (1800), KOLLA_CONFIG_DIR (~/kolla-config)
+EOF
+}
+
+delete=0 share=1 share_opt=0 names=()
+while (( $# )); do
+    case $1 in
+        --delete)          delete=1 ;;
+        --kolla-config)    KOLLA_CONFIG_DIR=$(option_value "$@") || exit 1; share_opt=1; shift ;;
+        --kolla-config=*)  KOLLA_CONFIG_DIR=${1#*=}; share_opt=1 ;;
+        --no-kolla-config) share=0; share_opt=1 ;;
+        -h|--help)         usage; exit 0 ;;
+        --)                shift; names+=("$@"); break ;;
+        -*)                die "unknown option: $1 (see --help)" ;;
+        *)                 names+=("$1") ;;
+    esac
+    shift
+done
+(( ${#names[@]} <= 1 )) || die "only one MAAS VM can exist; give at most one name"
+name=${names[0]:-maas}
+check_names "$name"
+
+if (( delete && share_opt )); then
+    die "--kolla-config and --no-kolla-config cannot be used with --delete"
+fi
+
+if (( delete )); then
+    instance_exists "$name" || die "instance '$name' does not exist"
+    incus delete --force "$name"
+    echo "Deleted $name"
+    exit 0
+fi
+
+require_cmds curl python3 sha256sum ssh
+require_profile "$PROFILE"
+if instance_exists "$name"; then
+    die "instance '$name' already exists (delete it with: incus-maas-node --delete $name)"
+fi
+users=$(incus query "/1.0/profiles/$PROFILE" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["used_by"]))')
+(( users == 0 )) || die "another instance already uses the '$PROFILE' profile (it pins MAC addresses and the IP)"
+
+# setup.sh writes the static PXE address into the profile.
+MAAS_IP=$(incus profile get "$PROFILE" cloud-init.network-config \
+    | grep -oE 'addresses: *\[ *[0-9]+(\.[0-9]+){3}' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -n1 || true)
+[[ -n $MAAS_IP ]] || die "no static address in the '$PROFILE' profile (run setup.sh)"
+MAAS_URL=http://$MAAS_IP:5240/MAAS/
+
+# Host keys change on every rebuild, so they are not recorded.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+identity=$(incus profile get "$PROFILE" user.ssh-identity)
+if [[ -n $identity ]]; then
+    SSH_OPTS+=(-i "$identity" -o IdentitiesOnly=yes)
+fi
+
+# download_verified <url> <sha256> <dest>: keep the file only if the checksum matches.
+download_verified() {
+    local url=$1 sum=$2 dest=$3
+    if [[ -f $dest ]] && echo "$sum  $dest" | sha256sum -c --quiet >/dev/null 2>&1; then
+        return 0
+    fi
+    rm -f "$dest"
+    curl -fL --retry 5 -o "$dest.part" "$url" || { rm -f "$dest.part"; return 1; }
+    if ! echo "$sum  $dest.part" | sha256sum -c --quiet; then
+        rm -f "$dest.part"
+        warn "checksum mismatch for $url"
+        return 1
+    fi
+    mv "$dest.part" "$dest"
+}
+
+ubuntu_arch() {
+    case $(uname -m) in
+        x86_64)  echo amd64 ;;
+        aarch64) echo arm64 ;;
+        ppc64le) echo ppc64el ;;
+        s390x)   echo s390x ;;
+        riscv64) echo riscv64 ;;
+        *)       die "no official Ubuntu image for architecture $(uname -m)" ;;
+    esac
+}
+
+import_image() {
+    local arch meta line sum file url dir metadata="" disk=""
+    arch=$(ubuntu_arch) || exit 1
+    echo "Image '$IMAGE' not found, importing the latest official Ubuntu 24.04 ($arch) build..."
+    # Output: "<version>", then "<sha256> <filename> <url>" per file.
+    mapfile -t meta < <(curl -fsSL "$STREAM" | python3 -I -c '
+import json, sys
+p = json.load(sys.stdin)["products"]["com.ubuntu.cloud:server:24.04:" + sys.argv[1]]["versions"]
+v = sorted(p)[-1]
+print(v)
+for i in p[v]["items"].values():
+    if i["ftype"] in ("lxd.tar.xz", "disk1.img"):
+        print(i["sha256"], i["path"].rsplit("/", 1)[-1], "https://cloud-images.ubuntu.com/" + i["path"])
+' "$arch")
+    (( ${#meta[@]} == 3 )) || die "could not find the image files in $STREAM"
+    dir=$CACHE/ubuntu-noble-$arch-${meta[0]}
+    mkdir -p "$dir"
+    for line in "${meta[@]:1}"; do
+        read -r sum file url <<<"$line"
+        download_verified "$url" "$sum" "$dir/$file" || die "download of $file failed"
+        if [[ $file == *-lxd.tar.xz ]]; then metadata=$dir/$file; else disk=$dir/$file; fi
+    done
+    incus image import "$metadata" "$disk" --alias "$IMAGE" </dev/null
+}
+
+# Stop waiting early if the install failed. "cloud-init status" exits 1 on
+# error, so only ssh's own 255 means "not reachable yet".
+cloud_init_failed() {
+    local status rc=0
+    status=$(ssh "${SSH_OPTS[@]}" "ubuntu@$MAAS_IP" cloud-init status 2>/dev/null) || rc=$?
+    (( rc != 255 )) || return 1
+    [[ $status == *"status: error"* ]]
+}
+
+api_exists "/1.0/images/aliases/$IMAGE" || import_image
+
+# virtiofs shares can't be hot-plugged, so attach the folder before first boot.
+incus init "$IMAGE" "$name" --vm -p "$PROFILE" </dev/null
+if (( share )); then
+    if ! mkdir -p "$KOLLA_CONFIG_DIR" \
+        || ! incus config device add "$name" kolla-config disk \
+            source="$(readlink -f "$KOLLA_CONFIG_DIR")" path=/etc/kolla >/dev/null; then
+        incus delete --force "$name"
+        die "could not share $KOLLA_CONFIG_DIR into the VM"
+    fi
+    echo "Sharing $(readlink -f "$KOLLA_CONFIG_DIR") as /etc/kolla"
+fi
+if ! incus start "$name"; then
+    incus delete --force "$name"
+    die "could not start $name; removed it"
+fi
+
+echo "Waiting for MAAS at $MAAS_URL (cloud-init installs it; this takes a while)..."
+end=$((SECONDS + WAIT_SECS))
+until curl -fsL -o /dev/null --max-time 5 "$MAAS_URL"; do
+    if cloud_init_failed; then
+        warn "cloud-init reported an error while installing MAAS:"
+        ssh "${SSH_OPTS[@]}" "ubuntu@$MAAS_IP" cloud-init status --long >&2 || true
+        die "see /var/log/cloud-init-output.log on the VM (ssh ubuntu@$MAAS_IP)"
+    fi
+    (( SECONDS < end )) || die "MAAS did not answer within $((WAIT_SECS / 60)) minutes (check: ssh ubuntu@$MAAS_IP cloud-init status --long)"
+    sleep 10
+done
+
+echo "MAAS is up at $MAAS_URL"
+echo "Next: ssh ubuntu@$MAAS_IP sudo maas createadmin"

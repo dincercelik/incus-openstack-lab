@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Create or delete empty, PXE-booting kolla node VMs for MAAS to deploy.
+# No set -e: a failure on one VM must not stop the others.
+set -uo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+PROFILE=${KOLLA_NODE_PROFILE:-kolla-node}
+
+usage() {
+    cat <<EOF
+Usage: incus-kolla-node [--memory SIZE] [--cpus N] <name>...
+       incus-kolla-node --delete <name>...
+
+Create empty VMs from the '$PROFILE' profile. They boot from the network first,
+so MAAS can commission and deploy them. VMs are created but not started.
+
+Options:
+  --memory SIZE   memory limit, e.g. 8GiB (default: from the profile)
+  --cpus N        CPU limit (default: from the profile)
+  --delete        delete the named VMs instead of creating them
+  -h, --help      show this help
+
+Examples:
+  incus-kolla-node hv01 hv02
+  incus-kolla-node --memory 8GiB cn0{1..3}
+  incus-kolla-node --delete cn01 hv01 hv02
+
+Environment: KOLLA_NODE_PROFILE (default: kolla-node)
+EOF
+}
+
+delete=0 memory="" cpus="" names=()
+while (( $# )); do
+    case $1 in
+        --delete)   delete=1 ;;
+        --memory)   memory=$(option_value "$@") || exit 1; shift ;;
+        --memory=*) memory=${1#*=} ;;
+        --cpus)     cpus=$(option_value "$@") || exit 1; shift ;;
+        --cpus=*)   cpus=${1#*=} ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; names+=("$@"); break ;;
+        -*)         die "unknown option: $1 (see --help)" ;;
+        *)          names+=("$1") ;;
+    esac
+    shift
+done
+(( ${#names[@]} )) || { usage >&2; exit 2; }
+check_names "${names[@]}"
+if (( delete )) && [[ -n $memory || -n $cpus ]]; then
+    die "--memory and --cpus cannot be used with --delete"
+fi
+
+failed=()
+if (( delete )); then
+    for name in "${names[@]}"; do
+        if ! instance_exists "$name"; then
+            warn "$name: does not exist"
+            failed+=("$name")
+        elif incus delete --force "$name"; then
+            echo "Deleted $name"
+        else
+            failed+=("$name")
+        fi
+    done
+else
+    require_profile "$PROFILE"
+    # Limits are set at creation, so a bad value creates nothing.
+    opts=()
+    [[ -n $memory ]] && opts+=(-c "limits.memory=$memory")
+    [[ -n $cpus ]] && opts+=(-c "limits.cpu=$cpus")
+    for name in "${names[@]}"; do
+        if incus init "$name" --empty --vm -p "$PROFILE" "${opts[@]}" </dev/null >/dev/null; then
+            echo "Created $name (PXE NIC MAC: $(incus config get "$name" volatile.eth0.hwaddr))"
+        else
+            failed+=("$name")
+        fi
+    done
+fi
+
+if (( ${#failed[@]} )); then
+    warn "Failed: ${failed[*]}"
+    exit 1
+fi
+if (( ! delete )); then
+    echo "Start them with: incus start ${names[*]}"
+fi

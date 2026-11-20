@@ -1,0 +1,23 @@
+config:
+  limits.cpu: "4"
+  limits.memory: 6GiB
+  security.secureboot: "false"
+description: Empty kolla node VM, PXE-booted and deployed by MAAS
+devices:
+  eth0:
+    boot.priority: "10"
+    network: maas-pxe
+    type: nic
+  eth1:
+    nictype: bridged
+    parent: kolla-ext
+    type: nic
+  eth2:
+    nictype: bridged
+    parent: kolla-ext
+    type: nic
+  root:
+    path: /
+    pool: ${POOL}
+    size: 40GiB
+    type: disk

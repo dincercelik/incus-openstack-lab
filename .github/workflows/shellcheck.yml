@@ -1,0 +1,24 @@
+name: shellcheck
+
+on:
+  push:
+  pull_request:
+
+env:
+  SHELLCHECK_VERSION: "0.11.0"
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned: the runner's own shellcheck is older.
+      - name: Install shellcheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$RUNNER_TEMP/bin" "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/shellcheck" --version
+      - name: Run shellcheck
+        run: shellcheck -x -S style setup.sh bin/* lib/*.sh

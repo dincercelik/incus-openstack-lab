@@ -1,0 +1,4 @@
+# partial image downloads and editor leftovers
+*.part
+*.swp
+*~

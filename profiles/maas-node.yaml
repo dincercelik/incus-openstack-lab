@@ -1,0 +1,63 @@
+config:
+  cloud-init.network-config: |-
+    # MACs must match eth0/eth1 under devices.
+    network:
+      version: 2
+      ethernets:
+        uplink:
+          match:
+            macaddress: "00:16:3e:20:00:01"
+          set-name: eth0
+          dhcp4: true
+        pxe:
+          match:
+            macaddress: "00:16:3e:20:00:02"
+          set-name: eth1
+          addresses: [${MAAS_IP}/${PXE_PREFIX}]
+  cloud-init.user-data: |-
+    #cloud-config
+    ssh_authorized_keys:
+      - ${SSH_PUBLIC_KEY}
+    apt:
+      conf: |
+        Acquire::Retries "10";
+      sources:
+        maas:
+          source: "ppa:maas/3.7"
+      debconf_selections:
+        maas: |
+          maas-region-controller maas/default-maas-url string ${MAAS_IP}
+          maas-rack-controller maas-rack-controller/maas-url string http://${MAAS_IP}:5240/MAAS
+    package_update: true
+    packages:
+      # Named explicitly, or apt keeps systemd-timesyncd and fails.
+      - chrony
+      - maas
+    # Shared from the host by incus-maas-node.
+    mounts:
+      - [incus_kolla-config, /etc/kolla, virtiofs, "defaults,nofail", "0", "0"]
+    runcmd:
+      - maas-region local_config_set --maas-url http://${MAAS_IP}:5240/MAAS
+      - maas-rack config --region-url http://${MAAS_IP}:5240/MAAS
+      - systemctl restart maas-regiond maas-rackd
+  limits.cpu: "2"
+  limits.memory: 4GiB
+  user.ssh-identity: "${SSH_IDENTITY}"
+description: MAAS region+rack controller VM (single instance - fixed MACs)
+devices:
+  cloud-init:
+    source: cloud-init:config
+    type: disk
+  eth0:
+    hwaddr: 00:16:3e:20:00:01
+    network: incusbr0
+    type: nic
+  eth1:
+    hwaddr: 00:16:3e:20:00:02
+    network: maas-pxe
+    type: nic
+  root:
+    path: /
+    pool: ${POOL}
+    size: 60GiB
+    type: disk
